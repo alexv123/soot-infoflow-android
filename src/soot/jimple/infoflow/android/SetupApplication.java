@@ -36,6 +36,7 @@ import soot.SootMethod;
 import soot.jimple.Stmt;
 import soot.jimple.infoflow.AbstractInfoflow;
 import soot.jimple.infoflow.Infoflow;
+import soot.jimple.infoflow.InfoflowConfiguration;
 import soot.jimple.infoflow.android.callbacks.AbstractCallbackAnalyzer;
 import soot.jimple.infoflow.android.callbacks.DefaultCallbackAnalyzer;
 import soot.jimple.infoflow.android.callbacks.FastCallbackAnalyzer;
@@ -54,6 +55,7 @@ import soot.jimple.infoflow.cfg.BiDirICFGFactory;
 import soot.jimple.infoflow.config.IInfoflowConfig;
 import soot.jimple.infoflow.data.SootMethodAndClass;
 import soot.jimple.infoflow.data.pathBuilders.DefaultPathBuilderFactory;
+import soot.jimple.infoflow.data.pathBuilders.DefaultPathBuilderFactory.PathBuilder;
 import soot.jimple.infoflow.entryPointCreators.AndroidEntryPointCreator;
 import soot.jimple.infoflow.handlers.ResultsAvailableHandler;
 import soot.jimple.infoflow.ipc.IIPCManager;
@@ -829,6 +831,13 @@ public class SetupApplication {
 			info.setIPCManager(ipcManager);
 		}
 
+		//InfoflowConfiguration.setPathAgnosticResults(false);
+		info.setPathBuilderFactory(new DefaultPathBuilderFactory(
+    			PathBuilder.ContextSensitive, true));
+		
+		
+		
+		
 		info.computeInfoflow(apkFileLocation, path, entryPointCreator, sourceSinkManager);
 		this.maxMemoryConsumption = info.getMaxMemoryConsumption();
 		this.collectedSources = info.getCollectedSources();

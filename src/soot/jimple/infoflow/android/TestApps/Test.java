@@ -18,12 +18,17 @@ import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.FilenameFilter;
 import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.UnsupportedEncodingException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
+import java.util.Map.Entry;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -36,7 +41,18 @@ import javax.xml.stream.XMLStreamException;
 
 import org.xmlpull.v1.XmlPullParserException;
 
+import soot.Body;
+import soot.NormalUnitPrinter;
+import soot.RefType;
+import soot.Scene;
+import soot.SootClass;
 import soot.SootMethod;
+import soot.SootMethodRef;
+import soot.Type;
+import soot.Unit;
+import soot.UnitPrinter;
+import soot.ValueBox;
+import soot.jimple.InvokeExpr;
 import soot.jimple.Stmt;
 import soot.jimple.infoflow.InfoflowConfiguration.CallgraphAlgorithm;
 import soot.jimple.infoflow.InfoflowManager;
@@ -57,13 +73,18 @@ import soot.jimple.infoflow.solver.cfg.IInfoflowCFG;
 import soot.jimple.infoflow.taintWrappers.EasyTaintWrapper;
 import soot.jimple.infoflow.taintWrappers.ITaintPropagationWrapper;
 import soot.jimple.infoflow.util.SystemClassHandler;
+import soot.jimple.internal.JAssignStmt;
+import soot.jimple.toolkits.callgraph.CallGraph;
+import soot.jimple.toolkits.callgraph.Sources;
 import soot.options.Options;
+import sun.net.NetworkServer;
 
 public class Test {
-	
-	private static final class MyResultsAvailableHandler implements
-			ResultsAvailableHandler {
+
+	private static final class MyResultsAvailableHandler implements ResultsAvailableHandler {
 		private final BufferedWriter wr;
+		ArrayList<HashMap<String, Integer>> features;
+		HashMap<String, Integer> packages;
 
 		private MyResultsAvailableHandler() {
 			this.wr = null;
@@ -74,24 +95,45 @@ public class Test {
 		}
 
 		@Override
-		public void onResultsAvailable(
-				IInfoflowCFG cfg, InfoflowResults results) {
-			// Dump the results
+		public void onResultsAvailable(IInfoflowCFG cfg, InfoflowResults results) {
+
 			if (results == null) {
 				print("No results found.");
-			}
-			else {
+			} else {
+				features = new ArrayList<HashMap<String, Integer>>();
+				for (int i = 0; i < 6; i++) {
+					features.add(new HashMap<String, Integer>());
+				}
+				// Renaming entities: the names of user declared classes and
+				// fields are not relevant here.
+				// Renaming them to 'local.method' and 'local.type respectively'
+
+				for (SootClass cl : Scene.v().getApplicationClasses()) {
+					cl.rename("local.classname");
+				}
+
+				this.renameEntities(cfg, results);
+
 				// Report the results
+				int pathNumber = 0;
 				for (ResultSinkInfo sink : results.getResults().keySet()) {
-					print("Found a flow to sink " + sink + ", from the following sources:");
+				//	print("\nFound a flow to sink " + sink + ", from the following sources:");
 					for (ResultSourceInfo source : results.getResults().get(sink)) {
-						print("\t- " + source.getSource() + " (in "
-								+ cfg.getMethodOf(source.getSource()).getSignature()  + ")");
-						if (source.getPath() != null)
-							print("\t\ton Path " + Arrays.toString(source.getPath()));
+				//		print("\t- " + source.getSource() + " (in " + cfg.getMethodOf(source.getSource()).getSignature();							+ ")");
+						
+						if (source.getPath() != null) {
+							print("\nPath "+(pathNumber+1)+": ");
+							for (Stmt p : source.getPath()) {
+								print("\t -> " + p.featuresToString());
+							}
+							extractPathFeatures(source, sink);
+							pathNumber++;
+							printToFile(pathNumber);
+						}
 					}
 				}
-				
+
+				System.out.println("\nFound a total of "+pathNumber+" paths.");
 				// Serialize the results if requested
 				// Write the results into a file if requested
 				if (resultFilePath != null && !resultFilePath.isEmpty()) {
@@ -108,8 +150,286 @@ public class Test {
 						throw new RuntimeException(ex);
 					}
 				}
+
+			}
+
+		}
+
+		private void renameEntities(IInfoflowCFG cfg, InfoflowResults results) {
+			System.err.println("Preparing results for vectorization");
+			getPackageNames();
+			for (ResultSinkInfo sink : results.getResults().keySet()) {
+				for (ResultSourceInfo source : results.getResults().get(sink)) {
+					if (source.getPath() != null) {
+						for (Stmt p : source.getPath()) {
+							// If there is a method invoke in our statement we
+							// may need to adjust it
+							if (p.containsInvokeExpr()) {
+
+								// if method is declared in application class
+								// if overriden library method -> set class name
+								// to library class
+								// else rename to local.classname - local.method
+								//
+								// if method is not declared in application
+								// class
+								// -> do nothing
+
+								if (isUserDefined(p.getInvokeExpr().getMethod().getDeclaringClass())) {
+									if (isAndroidJDKmethod(p.getInvokeExpr())) {
+
+									}
+
+									else if (p.getInvokeExpr().getMethod().getName().equals("<init>")) {
+										p.getInvokeExpr().getMethodRef().declaringClass().rename("local.classname");
+									} else {
+										p.getInvokeExpr().getMethodRef().setName("local.method");
+										p.getInvokeExpr().getMethodRef().declaringClass().rename("local.classname");
+									}
+
+								}
+
+							}
+							// If the field type is user-defined we rename it
+							if (p.containsFieldRef() && p.getFieldRef() instanceof RefType && Scene.v()
+									.getSootClass(p.getFieldRef().getType().toString()).isApplicationClass()) {
+								((RefType) p.getFieldRef().getType()).setClassName("local.type");
+							}
+					
+							if (p.containsArrayRef()) {
+
+							}
+						}
+					}
+				}
+			}
+		}
+
+		private void getPackageNames() {
+			packages = new HashMap<String, Integer>();
+			for (SootClass cl : Scene.v().getApplicationClasses()) {
+				packages.put(cl.getPackageName(), 1);
+			}
+		}
+
+		private boolean isUserDefined(SootClass declaringClass) {
+			if (declaringClass.isApplicationClass() || declaringClass.getName().equals("local.classname"))
+				return true;
+			try {
+				if (packages.get(declaringClass.getPackageName()) != null)
+					return true;
+			} catch (NullPointerException e) {
+			}
+			return false;
+		}
+
+		private boolean isAndroidJDKmethod(InvokeExpr ex) {
+			SootMethod m = ex.getMethod();
+			SootMethodRef mr = ex.getMethodRef();
+			SootClass c = m.getDeclaringClass().getSuperclass();
+			// Navigate the superclasses that might declare this method
+			while (c.hasSuperclass()) {
+				for (SootMethod index : c.getMethods()) {
+					if (index.getName().equals(m.getName())
+							&& index.getParameterTypes().equals(m.getParameterTypes())) {
+						m.setLibraryMethod(c.getName());
+						mr.setLibraryMethod(c.getName());
+						return true;
+					}
+				}
+				c = c.getSuperclass();
+			}
+
+			// Navigate the interfaces that might declare this method
+			for (SootClass intrf : m.getDeclaringClass().getInterfaces()) {
+				for (SootMethod index : intrf.getMethods()) {
+					if (index.getName().equals(m.getName())
+							&& index.getParameterTypes().equals(m.getParameterTypes())) {
+						m.setLibraryMethod(intrf.getName());
+						mr.setLibraryMethod(intrf.getName());
+						return true;
+					}
+				}
+			}
+			return false;
+		}
+
+		private void extractPathFeatures(ResultSourceInfo source, ResultSinkInfo sink) {
+			Stmt[] path = source.getPath();
+			String currentFeature = path[0].featuresToString();
+			// Add the source
+			features.get(0).put(source.getSource().featuresToString(), 1);
+			// Add the sink
+			features.get(1).put(sink.getSink().featuresToString(), 1);
+			// Add method calls
+			for (int i = 1; i < path.length - 1; i++) {
+				currentFeature = path[i].featuresToString();
+
+				if (path[i].containsInvokeExpr()) {
+					if (!isSanitizationMethod(path[i].getInvokeExpr())) {
+						try {
+							if (features.get(2) != null) {
+								features.get(2).put(currentFeature, features.get(2).get(path[i]) + 1);
+							}
+
+						} catch (IndexOutOfBoundsException e) {
+							features.set(2, new HashMap<String, Integer>());
+							features.get(2).put(currentFeature, 1);
+						} catch (NullPointerException en) {
+							features.get(2).put(currentFeature, 1);
+						}
+					}
+
+				}
+				// Add data type assignments
+				else{
+					try {
+						if (features.get(3) != null) {
+							features.get(3).put(currentFeature, features.get(3).get(path[i]) + 1);
+						}
+
+					} catch (IndexOutOfBoundsException e) {
+						features.set(3, new HashMap<String, Integer>());
+						features.get(3).put(currentFeature, 1);
+					} catch (NullPointerException en) {
+						features.get(3).put(currentFeature, 1);
+					}
+				}
+					
+				
+				
 			}
 			
+			
+			// Add sanitization methods. Check Sink and Source as well
+			for (int i = 0; i < path.length ; i++) {
+				currentFeature = path[i].featuresToString();
+			if (path[i].containsInvokeExpr() && isSanitizationMethod(path[i].getInvokeExpr())) {
+				try {
+					if (features.get(4) != null) {
+						features.get(4).put(currentFeature, features.get(4).get(path[i]) + 1);
+					}
+
+				} catch (IndexOutOfBoundsException e) {
+					features.set(4, new HashMap<String, Integer>());
+					features.get(4).put(currentFeature, 1);
+				} catch (NullPointerException en) {
+					features.get(4).put(currentFeature, 1);
+				}
+			}
+			
+			}
+			// Add path length
+			features.get(5).put("<path.length>", path.length);
+
+		
+		}
+
+		private boolean isSanitizationMethod(InvokeExpr ex) {
+			
+			SootMethod m = ex.getMethod();
+		
+			
+			 switch (m.getName()) {
+	            case "prepareStatement": if(m.getDeclaringClass().getName().equals("Connection")) return true ;
+	            case "query": if(m.getDeclaringClass().getName().equals("android.database.sqlite.SQLiteDatabase")) return true ;
+	            case "queryWithFactory": if(m.getDeclaringClass().getName().equals("android.database.sqlite.SQLiteDatabase")) return true ;
+	            case "normalize": if(m.getDeclaringClass().getName().equals("Normalizer")) return true ;
+	            case "compile": if(m.getDeclaringClass().getName().equals("Pattern")) return true;
+	            case "matcher": if(m.getDeclaringClass().getName().equals("Matcher")) return true;
+                
+                
+			 }
+			return false;
+		}
+
+		public String printFeatures(ArrayList<HashMap<String, Integer>> features) {
+			Iterator<HashMap<String, Integer>> it = features.iterator();
+			if (!it.hasNext())
+				return "[]";
+
+			StringBuilder sb = new StringBuilder();
+			for (;;) {
+				HashMap<String, Integer> e = it.next();
+				sb.append("\nPaths of depth " + (int) (features.indexOf(e) + 1) + " :\n");
+				sb.append(hashMapToString(e));
+				if (!it.hasNext())
+					return sb.toString();
+			}
+		}
+
+		// Helper method. Redefines the toString for a HashMap
+		public String hashMapToString(HashMap<String, Integer> map) {
+			Iterator<Entry<String, Integer>> i = map.entrySet().iterator();
+			if (!i.hasNext())
+				return "{}";
+
+			StringBuilder sb = new StringBuilder();
+
+			for (;;) {
+				Entry<String, Integer> e = i.next();
+				String key = e.getKey();
+				sb.append(key);
+				// Remove the new line for vectoralization
+				sb.append("\n");
+				// sb.append(value);
+				if (!i.hasNext())
+					return sb.toString();
+
+			}
+		}
+
+		// Helper method. Redefines the toString for a HashMap
+		public String hashMapToStringKeys(HashMap<String, Integer> map, int pathLength) {
+			
+			
+		
+			Iterator<Entry<String, Integer>> i = map.entrySet().iterator();
+			if (!i.hasNext())
+				return 4+SPLITEXPRESSION+0+SPLITEXPRESSION+"<sanitization>"+"\n";
+
+			StringBuilder sb = new StringBuilder();
+
+			for (;;) {
+				Entry<String, Integer> e = i.next();
+				String key = e.getKey();
+				Integer value = e.getValue();
+				sb.append(pathLength + SPLITEXPRESSION + value + SPLITEXPRESSION + key);
+				sb.append("\n");
+				if (!i.hasNext())
+					return sb.toString();
+
+			}
+			
+		}
+
+		public void printToFile(int pathNumber) {
+			try {
+				// Create a new folder for each .apk file
+				try {
+					Process p = Runtime.getRuntime().exec("mkdir "+"/home/hexd123/workspace/feature-extraction/data/"+Test.getSourceFileName());
+				} catch (IOException e) {
+					e.printStackTrace();
+				}
+				PrintWriter writer = new PrintWriter(
+						"/home/hexd123/workspace/feature-extraction/data/" + Test.getSourceFileName()+"/"+ Test.getSourceFileName() + "-features-path"+pathNumber+".txt");
+				for (int i=0;i<6; i++){
+					writer.print(hashMapToStringKeys(features.get(i), i));
+				}
+				System.out.println("Written features for " + Test.getSourceFileName() + " - path "+pathNumber+" to file.");
+				writer.close();
+
+			} catch (FileNotFoundException  e) {
+				e.printStackTrace();
+			}
+
+			//Clear contents of the features object. 
+			
+			
+			for (int i = 0; i < 6; i++) {
+				features.set(i,new HashMap<String, Integer>());
+			}
+
 		}
 
 		private void print(String string) {
@@ -117,81 +437,93 @@ public class Test {
 				System.out.println(string);
 				if (wr != null)
 					wr.write(string + "\n");
-			}
-			catch (IOException ex) {
+			} catch (IOException ex) {
 				// ignore
 			}
 		}
 	}
-	
+
+	public final static String SPLITEXPRESSION = "!-!";
 	private static InfoflowAndroidConfiguration config = new InfoflowAndroidConfiguration();
-	
+
 	private static int repeatCount = 1;
 	private static int timeout = -1;
 	private static int sysTimeout = -1;
-	
+
 	private static boolean aggressiveTaintWrapper = false;
 	private static boolean noTaintWrapper = false;
 	private static String summaryPath = "";
 	private static String resultFilePath = "";
-	
+
 	private static boolean DEBUG = false;
 
 	private static IIPCManager ipcManager = null;
-	public static void setIPCManager(IIPCManager ipcManager)
-	{
+
+	private static String sourceFileName;
+
+	public static String getSourceFileName() {
+		return sourceFileName.substring(0,sourceFileName.length()-4);
+	}
+
+	public static void setSourceFilePath(String sourceFilePath) {
+		Test.sourceFileName = sourceFilePath;
+	}
+
+	public static void setIPCManager(IIPCManager ipcManager) {
 		Test.ipcManager = ipcManager;
 	}
-	public static IIPCManager getIPCManager()
-	{
+
+	public static IIPCManager getIPCManager() {
 		return Test.ipcManager;
 	}
-	
+
 	/**
-	 * @param args Program arguments. args[0] = path to apk-file,
-	 * args[1] = path to android-dir (path/android-platforms/)
+	 * @param args
+	 *            Program arguments. args[0] = path to apk-file, args[1] = path
+	 *            to android-dir (path/android-platforms/)
 	 */
 	public static void main(final String[] args) throws IOException, InterruptedException {
 		if (args.length < 2) {
-			printUsage();	
+			printUsage();
 			return;
 		}
-		//start with cleanup:
+		// start with cleanup:
 		File outputDir = new File("JimpleOutput");
-		if (outputDir.isDirectory()){
+		if (outputDir.isDirectory()) {
 			boolean success = true;
-			for(File f : outputDir.listFiles()){
+			for (File f : outputDir.listFiles()) {
 				success = success && f.delete();
 			}
-			if(!success){
-				System.err.println("Cleanup of output directory "+ outputDir + " failed!");
+			if (!success) {
+				System.err.println("Cleanup of output directory " + outputDir + " failed!");
 			}
 			outputDir.delete();
 		}
-		
+
 		// Parse additional command-line arguments
 		if (!parseAdditionalOptions(args))
 			return;
 		if (!validateAdditionalOptions())
 			return;
-		if (repeatCount <= 0)
-			return;
-		
+		// if (repeatCount <= 0)
+		// return;
+
 		List<String> apkFiles = new ArrayList<String>();
 		File apkFile = new File(args[0]);
+		setSourceFilePath(apkFile.getName());
 		if (apkFile.isDirectory()) {
 			String[] dirFiles = apkFile.list(new FilenameFilter() {
-			
+
 				@Override
 				public boolean accept(File dir, String name) {
 					return (name.endsWith(".apk"));
 				}
-			
+
 			});
 			for (String s : dirFiles)
 				apkFiles.add(s);
 		} else {
-			//apk is a file so grab the extension
+			// apk is a file so grab the extension
 			String extension = apkFile.getName().substring(apkFile.getName().lastIndexOf("."));
 			if (extension.equalsIgnoreCase(".txt")) {
 				BufferedReader rdr = new BufferedReader(new FileReader(apkFile));
@@ -199,21 +531,20 @@ public class Test {
 				while ((line = rdr.readLine()) != null)
 					apkFiles.add(line);
 				rdr.close();
-			}
-			else if (extension.equalsIgnoreCase(".apk"))
+			} else if (extension.equalsIgnoreCase(".apk"))
 				apkFiles.add(args[0]);
 			else {
 				System.err.println("Invalid input file format: " + extension);
 				return;
 			}
 		}
-		
+
 		int oldRepeatCount = repeatCount;
 		for (final String fileName : apkFiles) {
 			repeatCount = oldRepeatCount;
 			final String fullFilePath;
 			System.gc();
-			
+
 			// Directory handling
 			if (apkFiles.size() > 1) {
 				if (apkFile.isDirectory())
@@ -225,61 +556,56 @@ public class Test {
 				if (flagFile.exists())
 					continue;
 				flagFile.createNewFile();
-			}
-			else
+			} else
 				fullFilePath = fileName;
 
 			// Run the analysis
-			while (repeatCount > 0) {
-				System.gc();
-				if (timeout > 0)
-					runAnalysisTimeout(fullFilePath, args[1]);
-				else if (sysTimeout > 0)
-					runAnalysisSysTimeout(fullFilePath, args[1]);
-				else
-					runAnalysis(fullFilePath, args[1]);
-				repeatCount--;
-			}
-			
+			// while (repeatCount > 0) {
+			System.gc();
+			if (timeout > 0)
+				runAnalysisTimeout(fullFilePath, args[1]);
+			else if (sysTimeout > 0)
+				runAnalysisSysTimeout(fullFilePath, args[1]);
+			else
+				runAnalysis(fullFilePath, args[1]);
+			repeatCount--;
+			// }
+
 			System.gc();
 		}
 	}
 
 	/**
 	 * Parses the optional command-line arguments
-	 * @param args The array of arguments to parse
+	 * 
+	 * @param args
+	 *            The array of arguments to parse
 	 * @return True if all arguments are valid and could be parsed, otherwise
-	 * false
+	 *         false
 	 */
 	private static boolean parseAdditionalOptions(String[] args) {
 		int i = 2;
 		while (i < args.length) {
 			if (args[i].equalsIgnoreCase("--timeout")) {
-				timeout = Integer.valueOf(args[i+1]);
+				timeout = Integer.valueOf(args[i + 1]);
 				i += 2;
-			}
-			else if (args[i].equalsIgnoreCase("--systimeout")) {
-				sysTimeout = Integer.valueOf(args[i+1]);
+			} else if (args[i].equalsIgnoreCase("--systimeout")) {
+				sysTimeout = Integer.valueOf(args[i + 1]);
 				i += 2;
-			}
-			else if (args[i].equalsIgnoreCase("--singleflow")) {
+			} else if (args[i].equalsIgnoreCase("--singleflow")) {
 				config.setStopAfterFirstFlow(true);
 				i++;
-			}
-			else if (args[i].equalsIgnoreCase("--implicit")) {
+			} else if (args[i].equalsIgnoreCase("--implicit")) {
 				config.setEnableImplicitFlows(true);
 				i++;
-			}
-			else if (args[i].equalsIgnoreCase("--nostatic")) {
+			} else if (args[i].equalsIgnoreCase("--nostatic")) {
 				config.setEnableStaticFieldTracking(false);
 				i++;
-			}
-			else if (args[i].equalsIgnoreCase("--aplength")) {
-				InfoflowAndroidConfiguration.setAccessPathLength(Integer.valueOf(args[i+1]));
+			} else if (args[i].equalsIgnoreCase("--aplength")) {
+				InfoflowAndroidConfiguration.setAccessPathLength(Integer.valueOf(args[i + 1]));
 				i += 2;
-			}
-			else if (args[i].equalsIgnoreCase("--cgalgo")) {
-				String algo = args[i+1];
+			} else if (args[i].equalsIgnoreCase("--cgalgo")) {
+				String algo = args[i + 1];
 				if (algo.equalsIgnoreCase("AUTO"))
 					config.setCallgraphAlgorithm(CallgraphAlgorithm.AutomaticSelection);
 				else if (algo.equalsIgnoreCase("CHA"))
@@ -297,17 +623,14 @@ public class Test {
 					return false;
 				}
 				i += 2;
-			}
-			else if (args[i].equalsIgnoreCase("--nocallbacks")) {
+			} else if (args[i].equalsIgnoreCase("--nocallbacks")) {
 				config.setEnableCallbacks(false);
 				i++;
-			}
-			else if (args[i].equalsIgnoreCase("--noexceptions")) {
+			} else if (args[i].equalsIgnoreCase("--noexceptions")) {
 				config.setEnableExceptionTracking(false);
 				i++;
-			}
-			else if (args[i].equalsIgnoreCase("--layoutmode")) {
-				String algo = args[i+1];
+			} else if (args[i].equalsIgnoreCase("--layoutmode")) {
+				String algo = args[i + 1];
 				if (algo.equalsIgnoreCase("NONE"))
 					config.setLayoutMatchingMode(LayoutMatchingMode.NoMatch);
 				else if (algo.equalsIgnoreCase("PWD"))
@@ -319,25 +642,20 @@ public class Test {
 					return false;
 				}
 				i += 2;
-			}
-			else if (args[i].equalsIgnoreCase("--aliasflowins")) {
+			} else if (args[i].equalsIgnoreCase("--aliasflowins")) {
 				config.setFlowSensitiveAliasing(false);
 				i++;
-			}
-			else if (args[i].equalsIgnoreCase("--paths")) {
+			} else if (args[i].equalsIgnoreCase("--paths")) {
 				config.setComputeResultPaths(true);
 				i++;
-			}
-			else if (args[i].equalsIgnoreCase("--nopaths")) {
+			} else if (args[i].equalsIgnoreCase("--nopaths")) {
 				config.setComputeResultPaths(false);
 				i++;
-			}
-			else if (args[i].equalsIgnoreCase("--aggressivetw")) {
+			} else if (args[i].equalsIgnoreCase("--aggressivetw")) {
 				aggressiveTaintWrapper = false;
 				i++;
-			}
-			else if (args[i].equalsIgnoreCase("--pathalgo")) {
-				String algo = args[i+1];
+			} else if (args[i].equalsIgnoreCase("--pathalgo")) {
+				String algo = args[i + 1];
 				if (algo.equalsIgnoreCase("CONTEXTSENSITIVE"))
 					config.setPathBuilder(PathBuilder.ContextSensitive);
 				else if (algo.equalsIgnoreCase("CONTEXTINSENSITIVE"))
@@ -349,49 +667,38 @@ public class Test {
 					return false;
 				}
 				i += 2;
-			}
-			else if (args[i].equalsIgnoreCase("--summarypath")) {
+			} else if (args[i].equalsIgnoreCase("--summarypath")) {
 				summaryPath = args[i + 1];
 				i += 2;
-			}
-			else if (args[i].equalsIgnoreCase("--saveresults")) {
+			} else if (args[i].equalsIgnoreCase("--saveresults")) {
 				resultFilePath = args[i + 1];
 				i += 2;
-			}
-			else if (args[i].equalsIgnoreCase("--sysflows")) {
+			} else if (args[i].equalsIgnoreCase("--sysflows")) {
 				config.setIgnoreFlowsInSystemPackages(false);
 				i++;
-			}
-			else if (args[i].equalsIgnoreCase("--notaintwrapper")) {
+			} else if (args[i].equalsIgnoreCase("--notaintwrapper")) {
 				noTaintWrapper = true;
 				i++;
-			}
-			else if (args[i].equalsIgnoreCase("--repeatcount")) {
+			} else if (args[i].equalsIgnoreCase("--repeatcount")) {
 				repeatCount = Integer.parseInt(args[i + 1]);
 				i += 2;
-			}
-			else if (args[i].equalsIgnoreCase("--noarraysize")) {
+			} else if (args[i].equalsIgnoreCase("--noarraysize")) {
 				config.setEnableArraySizeTainting(false);
 				i++;
-			}
-			else if (args[i].equalsIgnoreCase("--arraysize")) {
+			} else if (args[i].equalsIgnoreCase("--arraysize")) {
 				config.setEnableArraySizeTainting(true);
 				i++;
-			}
-			else if (args[i].equalsIgnoreCase("--notypetightening")) {
+			} else if (args[i].equalsIgnoreCase("--notypetightening")) {
 				InfoflowAndroidConfiguration.setUseTypeTightening(false);
 				i++;
-			}
-			else if (args[i].equalsIgnoreCase("--safemode")) {
+			} else if (args[i].equalsIgnoreCase("--safemode")) {
 				InfoflowAndroidConfiguration.setUseThisChainReduction(false);
 				i++;
-			}
-			else if (args[i].equalsIgnoreCase("--logsourcesandsinks")) {
+			} else if (args[i].equalsIgnoreCase("--logsourcesandsinks")) {
 				config.setLogSourcesAndSinks(true);
 				i++;
-			}
-			else if (args[i].equalsIgnoreCase("--callbackanalyzer")) {
-				String algo = args[i+1];
+			} else if (args[i].equalsIgnoreCase("--callbackanalyzer")) {
+				String algo = args[i + 1];
 				if (algo.equalsIgnoreCase("DEFAULT"))
 					config.setCallbackAnalyzer(CallbackAnalyzer.Default);
 				else if (algo.equalsIgnoreCase("FAST"))
@@ -401,27 +708,23 @@ public class Test {
 					return false;
 				}
 				i += 2;
-			}
-			else if (args[i].equalsIgnoreCase("--maxthreadnum")){
-				config.setMaxThreadNum(Integer.valueOf(args[i+1]));
+			} else if (args[i].equalsIgnoreCase("--maxthreadnum")) {
+				config.setMaxThreadNum(Integer.valueOf(args[i + 1]));
 				i += 2;
-			}
-			else if (args[i].equalsIgnoreCase("--arraysizetainting")) {
+			} else if (args[i].equalsIgnoreCase("--arraysizetainting")) {
 				config.setEnableArraySizeTainting(true);
 				i++;
-			}
-			else
+			} else
 				i++;
 		}
 		return true;
 	}
-	
+
 	private static boolean validateAdditionalOptions() {
 		if (timeout > 0 && sysTimeout > 0) {
 			return false;
 		}
-		if (!config.getFlowSensitiveAliasing()
-				&& config.getCallgraphAlgorithm() != CallgraphAlgorithm.OnDemand
+		if (!config.getFlowSensitiveAliasing() && config.getCallgraphAlgorithm() != CallgraphAlgorithm.OnDemand
 				&& config.getCallgraphAlgorithm() != CallgraphAlgorithm.AutomaticSelection) {
 			System.err.println("Flow-insensitive aliasing can only be configured for callgraph "
 					+ "algorithms that support this choice.");
@@ -429,33 +732,33 @@ public class Test {
 		}
 		return true;
 	}
-	
+
 	private static void runAnalysisTimeout(final String fileName, final String androidJar) {
 		FutureTask<InfoflowResults> task = new FutureTask<InfoflowResults>(new Callable<InfoflowResults>() {
 
 			@Override
 			public InfoflowResults call() throws Exception {
-				
-				final BufferedWriter wr = new BufferedWriter(new FileWriter("_out_" + new File(fileName).getName() + ".txt"));
+
+				final BufferedWriter wr = new BufferedWriter(
+						new FileWriter("_out_" + new File(fileName).getName() + ".txt"));
 				try {
 					final long beforeRun = System.nanoTime();
 					wr.write("Running data flow analysis...\n");
 					final InfoflowResults res = runAnalysis(fileName, androidJar);
 					wr.write("Analysis has run for " + (System.nanoTime() - beforeRun) / 1E9 + " seconds\n");
-					
+
 					wr.flush();
 					return res;
-				}
-				finally {
+				} finally {
 					if (wr != null)
 						wr.close();
 				}
 			}
-			
+
 		});
 		ExecutorService executor = Executors.newFixedThreadPool(1);
 		executor.execute(task);
-		
+
 		try {
 			System.out.println("Running infoflow task...");
 			task.get(timeout, TimeUnit.MINUTES);
@@ -469,48 +772,41 @@ public class Test {
 			System.err.println("Infoflow computation interrupted: " + e.getMessage());
 			e.printStackTrace();
 		}
-		
+
 		// Make sure to remove leftovers
-		executor.shutdown();		
+		executor.shutdown();
 	}
 
 	private static void runAnalysisSysTimeout(final String fileName, final String androidJar) {
 		String classpath = System.getProperty("java.class.path");
 		String javaHome = System.getProperty("java.home");
 		String executable = "/usr/bin/timeout";
-		String[] command = new String[] { executable,
-				"-s", "KILL",
-				sysTimeout + "m",
-				javaHome + "/bin/java",
-				"-cp", classpath,
-				"soot.jimple.infoflow.android.TestApps.Test",
-				fileName,
-				androidJar,
+		String[] command = new String[] { executable, "-s", "KILL", sysTimeout + "m", javaHome + "/bin/java", "-cp",
+				classpath, "soot.jimple.infoflow.android.TestApps.Test", fileName, androidJar,
 				config.getStopAfterFirstFlow() ? "--singleflow" : "--nosingleflow",
 				config.getEnableImplicitFlows() ? "--implicit" : "--noimplicit",
-				config.getEnableStaticFieldTracking() ? "--static" : "--nostatic", 
-				"--aplength", Integer.toString(InfoflowAndroidConfiguration.getAccessPathLength()),
-				"--cgalgo", callgraphAlgorithmToString(config.getCallgraphAlgorithm()),
+				config.getEnableStaticFieldTracking() ? "--static" : "--nostatic", "--aplength",
+				Integer.toString(InfoflowAndroidConfiguration.getAccessPathLength()), "--cgalgo",
+				callgraphAlgorithmToString(config.getCallgraphAlgorithm()),
 				config.getEnableCallbacks() ? "--callbacks" : "--nocallbacks",
-				config.getEnableExceptionTracking() ? "--exceptions" : "--noexceptions",
-				"--layoutmode", layoutMatchingModeToString(config.getLayoutMatchingMode()),
+				config.getEnableExceptionTracking() ? "--exceptions" : "--noexceptions", "--layoutmode",
+				layoutMatchingModeToString(config.getLayoutMatchingMode()),
 				config.getFlowSensitiveAliasing() ? "--aliasflowsens" : "--aliasflowins",
 				config.getComputeResultPaths() ? "--paths" : "--nopaths",
-				aggressiveTaintWrapper ? "--aggressivetw" : "--nonaggressivetw",
-				"--pathalgo", pathAlgorithmToString(config.getPathBuilder()),
+				aggressiveTaintWrapper ? "--aggressivetw" : "--nonaggressivetw", "--pathalgo",
+				pathAlgorithmToString(config.getPathBuilder()),
 				(summaryPath != null && !summaryPath.isEmpty()) ? "--summarypath" : "",
 				(summaryPath != null && !summaryPath.isEmpty()) ? summaryPath : "",
 				(resultFilePath != null && !resultFilePath.isEmpty()) ? "--saveresults" : "",
 				noTaintWrapper ? "--notaintwrapper" : "",
-//				"--repeatCount", Integer.toString(repeatCount),
+				// "--repeatCount", Integer.toString(repeatCount),
 				config.getEnableArraySizeTainting() ? "" : "--noarraysize",
 				InfoflowAndroidConfiguration.getUseTypeTightening() ? "" : "--notypetightening",
 				InfoflowAndroidConfiguration.getUseThisChainReduction() ? "" : "--safemode",
-				config.getLogSourcesAndSinks() ? "--logsourcesandsinks" : "",
-				"--callbackanalyzer", callbackAlgorithmToString(config.getCallbackAnalyzer()),
-				"--maxthreadnum", Integer.toString(config.getMaxThreadNum()),
-				config.getEnableArraySizeTainting() ? "--arraysizetainting" : ""
-				};
+				config.getLogSourcesAndSinks() ? "--logsourcesandsinks" : "", "--callbackanalyzer",
+				callbackAlgorithmToString(config.getCallbackAnalyzer()), "--maxthreadnum",
+				Integer.toString(config.getMaxThreadNum()),
+				config.getEnableArraySizeTainting() ? "--arraysizetainting" : "" };
 		System.out.println("Running command: " + executable + " " + Arrays.toString(command));
 		try {
 			ProcessBuilder pb = new ProcessBuilder(command);
@@ -526,60 +822,60 @@ public class Test {
 			ex.printStackTrace();
 		}
 	}
-	
+
 	private static String callgraphAlgorithmToString(CallgraphAlgorithm algorihm) {
 		switch (algorihm) {
-			case AutomaticSelection:
-				return "AUTO";
-			case CHA:
-				return "CHA";
-			case VTA:
-				return "VTA";
-			case RTA:
-				return "RTA";
-			case SPARK:
-				return "SPARK";
-			case GEOM:
-				return "GEOM";
-			default:
-				return "unknown";
+		case AutomaticSelection:
+			return "AUTO";
+		case CHA:
+			return "CHA";
+		case VTA:
+			return "VTA";
+		case RTA:
+			return "RTA";
+		case SPARK:
+			return "SPARK";
+		case GEOM:
+			return "GEOM";
+		default:
+			return "unknown";
 		}
 	}
 
 	private static String layoutMatchingModeToString(LayoutMatchingMode mode) {
 		switch (mode) {
-			case NoMatch:
-				return "NONE";
-			case MatchSensitiveOnly:
-				return "PWD";
-			case MatchAll:
-				return "ALL";
-			default:
-				return "unknown";
+		case NoMatch:
+			return "NONE";
+		case MatchSensitiveOnly:
+			return "PWD";
+		case MatchAll:
+			return "ALL";
+		default:
+			return "unknown";
 		}
 	}
-	
+
 	private static String pathAlgorithmToString(PathBuilder pathBuilder) {
 		switch (pathBuilder) {
-			case ContextSensitive:
-				return "CONTEXTSENSITIVE";
-			case ContextInsensitive :
-				return "CONTEXTINSENSITIVE";
-			case ContextInsensitiveSourceFinder :
-				return "SOURCESONLY";
-			default :
-				return "UNKNOWN";
+		case ContextSensitive:
+			return "CONTEXTSENSITIVE";
+		case ContextInsensitive:
+			return "CONTEXTINSENSITIVE";
+		case ContextInsensitiveSourceFinder:
+			return "SOURCESONLY";
+		default:
+			return "UNKNOWN";
 		}
 	}
-	
+
 	private static String callbackAlgorithmToString(CallbackAnalyzer analyzer) {
 		switch (analyzer) {
-			case Default:
-				return "DEFAULT";
-			case Fast:
-				return "FAST";
-			default :
-				return "UNKNOWN";
+		case Default:
+			return "DEFAULT";
+		case Fast:
+			return "FAST";
+		default:
+			return "UNKNOWN";
 		}
 	}
 
@@ -588,27 +884,24 @@ public class Test {
 			final long beforeRun = System.nanoTime();
 
 			final SetupApplication app;
-			if (null == ipcManager)
-			{
+			if (null == ipcManager) {
 				app = new SetupApplication(androidJar, fileName);
-			}
-			else
-			{
+			} else {
 				app = new SetupApplication(androidJar, fileName, ipcManager);
 			}
-			
+
 			// Set configuration object
 			app.setConfig(config);
 			if (noTaintWrapper)
 				app.setSootConfig(new IInfoflowConfig() {
-					
+
 					@Override
 					public void setSootOptions(Options options) {
 						options.set_include_all(true);
 					}
-					
+
 				});
-			
+
 			final ITaintPropagationWrapper taintWrapper;
 			if (noTaintWrapper)
 				taintWrapper = null;
@@ -619,38 +912,28 @@ public class Test {
 					System.err.println("Could not initialize StubDroid");
 					return null;
 				}
-			}
-			else {
+			} else {
 				final EasyTaintWrapper easyTaintWrapper;
-				File twSourceFile = new File("../soot-infoflow/EasyTaintWrapperSource.txt");
-				if (twSourceFile.exists())
-					easyTaintWrapper = new EasyTaintWrapper(twSourceFile);
-				else {
-					twSourceFile = new File("EasyTaintWrapperSource.txt");
-					if (twSourceFile.exists())
-						easyTaintWrapper = new EasyTaintWrapper(twSourceFile);
-					else {
-						System.err.println("Taint wrapper definition file not found at "
-								+ twSourceFile.getAbsolutePath());
-						return null;
-					}
-				}
+				if (new File("../soot-infoflow/EasyTaintWrapperSource.txt").exists())
+					easyTaintWrapper = new EasyTaintWrapper("../soot-infoflow/EasyTaintWrapperSource.txt");
+				else
+					easyTaintWrapper = new EasyTaintWrapper("EasyTaintWrapperSource.txt");
 				easyTaintWrapper.setAggressiveMode(aggressiveTaintWrapper);
 				taintWrapper = easyTaintWrapper;
 			}
 			app.setTaintWrapper(taintWrapper);
 			app.calculateSourcesSinksEntrypoints("SourcesAndSinks.txt");
-			
+
 			if (DEBUG) {
 				app.printEntrypoints();
 				app.printSinks();
 				app.printSources();
 			}
-			
+
 			System.out.println("Running data flow analysis...");
 			final InfoflowResults res = app.runInfoflow(new MyResultsAvailableHandler());
 			System.out.println("Analysis has run for " + (System.nanoTime() - beforeRun) / 1E9 + " seconds");
-			
+
 			if (config.getLogSourcesAndSinks()) {
 				if (!app.getCollectedSources().isEmpty()) {
 					System.out.println("Collected sources:");
@@ -663,7 +946,7 @@ public class Test {
 						System.out.println("\t" + s);
 				}
 			}
-			
+
 			return res;
 		} catch (IOException ex) {
 			System.err.println("Could not read file: " + ex.getMessage());
@@ -675,102 +958,100 @@ public class Test {
 			throw new RuntimeException(ex);
 		}
 	}
-	
+
 	/**
 	 * Creates the taint wrapper for using library summaries
+	 * 
 	 * @return The taint wrapper for using library summaries
-	 * @throws IOException Thrown if one of the required files could not be read
+	 * @throws IOException
+	 *             Thrown if one of the required files could not be read
 	 */
 	@SuppressWarnings({ "rawtypes", "unchecked" })
-	private static ITaintPropagationWrapper createLibrarySummaryTW()
-			throws IOException {
+	private static ITaintPropagationWrapper createLibrarySummaryTW() throws IOException {
 		try {
-			Class clzLazySummary = Class.forName("soot.jimple.infoflow.methodSummary.data.provider.LazySummaryProvider");
-			Class itfLazySummary = Class.forName("soot.jimple.infoflow.methodSummary.data.provider.IMethodSummaryProvider");
-			
+			Class clzLazySummary = Class
+					.forName("soot.jimple.infoflow.methodSummary.data.provider.LazySummaryProvider");
+			Class itfLazySummary = Class
+					.forName("soot.jimple.infoflow.methodSummary.data.provider.IMethodSummaryProvider");
+
 			Object lazySummary = clzLazySummary.getConstructor(File.class).newInstance(new File(summaryPath));
-			
-			ITaintPropagationWrapper summaryWrapper = (ITaintPropagationWrapper) Class.forName
-					("soot.jimple.infoflow.methodSummary.taintWrappers.SummaryTaintWrapper").getConstructor
-					(itfLazySummary).newInstance(lazySummary);
-			
+
+			ITaintPropagationWrapper summaryWrapper = (ITaintPropagationWrapper) Class
+					.forName("soot.jimple.infoflow.methodSummary.taintWrappers.SummaryTaintWrapper")
+					.getConstructor(itfLazySummary).newInstance(lazySummary);
+
 			ITaintPropagationWrapper systemClassWrapper = new ITaintPropagationWrapper() {
-				
+
 				private ITaintPropagationWrapper wrapper = new EasyTaintWrapper("EasyTaintWrapperSource.txt");
-				
+
 				private boolean isSystemClass(Stmt stmt) {
 					if (stmt.containsInvokeExpr())
-						return SystemClassHandler.isClassInSystemPackage(
-								stmt.getInvokeExpr().getMethod().getDeclaringClass().getName());
+						return SystemClassHandler
+								.isClassInSystemPackage(stmt.getInvokeExpr().getMethod().getDeclaringClass().getName());
 					return false;
 				}
-				
+
 				@Override
 				public boolean supportsCallee(Stmt callSite) {
 					return isSystemClass(callSite) && wrapper.supportsCallee(callSite);
 				}
-				
+
 				@Override
 				public boolean supportsCallee(SootMethod method) {
 					return SystemClassHandler.isClassInSystemPackage(method.getDeclaringClass().getName())
 							&& wrapper.supportsCallee(method);
 				}
-				
+
 				@Override
 				public boolean isExclusive(Stmt stmt, Abstraction taintedPath) {
 					return isSystemClass(stmt) && wrapper.isExclusive(stmt, taintedPath);
 				}
-				
+
 				@Override
 				public void initialize(InfoflowManager manager) {
 					wrapper.initialize(manager);
 				}
-				
+
 				@Override
 				public int getWrapperMisses() {
 					return 0;
 				}
-				
+
 				@Override
 				public int getWrapperHits() {
 					return 0;
 				}
-				
+
 				@Override
-				public Set<Abstraction> getTaintsForMethod(Stmt stmt, Abstraction d1,
-						Abstraction taintedPath) {
+				public Set<Abstraction> getTaintsForMethod(Stmt stmt, Abstraction d1, Abstraction taintedPath) {
 					if (!isSystemClass(stmt))
 						return null;
 					return wrapper.getTaintsForMethod(stmt, d1, taintedPath);
 				}
-				
+
 				@Override
-				public Set<Abstraction> getAliasesForMethod(Stmt stmt, Abstraction d1,
-						Abstraction taintedPath) {
+				public Set<Abstraction> getAliasesForMethod(Stmt stmt, Abstraction d1, Abstraction taintedPath) {
 					if (!isSystemClass(stmt))
 						return null;
 					return wrapper.getAliasesForMethod(stmt, d1, taintedPath);
 				}
-				
+
 			};
-			
+
 			Method setFallbackMethod = summaryWrapper.getClass().getMethod("setFallbackTaintWrapper",
 					ITaintPropagationWrapper.class);
 			setFallbackMethod.invoke(summaryWrapper, systemClassWrapper);
-			
+
 			return summaryWrapper;
-		}
-		catch (ClassNotFoundException | NoSuchMethodException ex) {
+		} catch (ClassNotFoundException | NoSuchMethodException ex) {
 			System.err.println("Could not find library summary classes: " + ex.getMessage());
 			ex.printStackTrace();
 			return null;
-		}
-		catch (InvocationTargetException ex) {
+		} catch (InvocationTargetException ex) {
 			System.err.println("Could not initialize library summaries: " + ex.getMessage());
 			ex.printStackTrace();
 			return null;
-		}
-		catch (IllegalAccessException | InstantiationException ex) {
+		} catch (IllegalAccessException | InstantiationException ex) {
 			System.err.println("Internal error in library summary initialization: " + ex.getMessage());
 			ex.printStackTrace();
 			return null;
